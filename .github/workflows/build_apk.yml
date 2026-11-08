@@ -1,206 +1,194 @@
-    name: Porting OEM Apps
-    run-name: ${{ inputs.run_id }}
+name: Porting OEM Apps
+run-name: ${{ inputs.run_id }}
 
-    on:
-      workflow_dispatch:
-        inputs:
-          apk_link:
-            description: "Direct APK download link (ex: https://link.example/file.apk)"
-            required: true
-            type: string
+on:
+  workflow_dispatch:
+    inputs:
+      apk_link:
+        description: "Direct APK download link (ex: https://link.example/file.apk)"
+        required: true
+        type: string
 
-          apk_name:
-            description: "Output APK name (ex: OplusCalculator)"
-            required: true
-            type: string
+      apk_name:
+        description: "Output APK name (ex: OplusCalculator)"
+        required: true
+        type: string
 
-          patch:
-            description: "Patch Type (ex: samsung,oneplus,moto,xiaomi,oppo)"
-            required: true
-            type: string
+      patch:
+        description: "Patch Type (ex: samsung,oneplus,moto,xiaomi,oppo)"
+        required: true
+        type: string
 
-          run_id:
-            description: "Release ID (ex: oppocalculator-cos17)"
-            required: true
-            type: string
+      run_id:
+        description: "Release ID (ex: oppocalculator-cos17)"
+        required: true
+        type: string
 
-          ai:
-            description: "Extra: AI smali review of injected classes (true/false)"
-            required: false
-            type: boolean
-            default: false
+      ai:
+        description: "Extra: AI smali review of injected classes (true/false)"
+        required: false
+        type: boolean
+        default: false
 
-    permissions:
-      contents: write
+permissions:
+  contents: write
 
-    jobs:
-      build:
-        runs-on: ubuntu-latest
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-        steps:
-          - name: Checkout repository
-            uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-          - name: Set up Java JDK
-            uses: actions/setup-java@v4
-            with:
-              distribution: temurin
-              java-version: "17"
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-          - name: Install tools
-            run: |
-              sudo apt-get update
-              sudo apt-get install -y xmlstarlet
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xmlstarlet
 
-          - name: Download source APK
-            env:
-              APK_LINK: ${{ inputs.apk_link }}
-            run: |
-              set -euo pipefail
+      - name: Download source APK
+        env:
+          APK_LINK: ${{ inputs.apk_link }}
+        run: |
+          set -euo pipefail
 
-              APK_PATH="$GITHUB_WORKSPACE/input.apk"
+          APK_PATH="$GITHUB_WORKSPACE/input.apk"
 
-              echo "Downloading APK from direct link..."
+          echo "Downloading APK from direct link..."
 
-              curl -fSL \
-                --retry 5 \
-                --retry-delay 2 \
-                --retry-connrefused \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                "$APK_LINK" \
-                -o "$APK_PATH"
+          curl -fSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            "$APK_LINK" \
+            -o "$APK_PATH"
 
-              if [ ! -s "$APK_PATH" ]; then
-                echo "::error::APK download failed or the file is empty."
-                exit 1
-              fi
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK download failed or the file is empty."
+            exit 1
+          fi
 
-              echo "APK downloaded successfully."
-              ls -lh "$APK_PATH"
+          echo "APK downloaded successfully."
+          ls -lh "$APK_PATH"
 
-          - name: Run port
-            env:
-              PATCH_NAME: ${{ inputs.patch }}
-              AI_INPUT: ${{ inputs.ai }}
-              # optional: set a repo variable AI_API_URL to use another endpoint
-              AI_API_URL: ${{ vars.AI_API_URL }}
-            run: |
-              set -euo pipefail
+      - name: Run port
+        env:
+          PATCH_NAME: ${{ inputs.patch }}
+          AI_INPUT: ${{ inputs.ai }}
+          # optional: set a repo variable AI_API_URL to use another endpoint
+          AI_API_URL: ${{ vars.AI_API_URL }}
+        run: |
+          set -euo pipefail
 
-              PORT_ARGS=()
-              if [ "$AI_INPUT" = "true" ]; then
-                echo "AI smali review: ON"
-                PORT_ARGS+=(--ai)
-              else
-                echo "AI smali review: OFF"
-              fi
+          # Create a helper script to patch Samsung-specific AccessibilityManager calls
+          cat << 'EOF' > fix_samsung_smali.sh
+          echo "Applying custom Smali patch for semIsScreenReaderEnabled..."
+          find . -type f -name "*.smali" -exec sed -i \
+            's/Landroid\/view\/accessibility\/AccessibilityManager;->semIsScreenReaderEnabled()Z/Landroid\/view\/accessibility\/AccessibilityManager;->isTouchExplorationEnabled()Z/g' {} +
+          EOF
+          chmod +x fix_samsung_smali.sh
 
-              bash build_port.sh input.apk "$PATCH_NAME" "${PORT_ARGS[@]}"
+          # Inject the helper script into build_port.sh right before apktool rebuilds the APK
+          sed -i '/apktool.* b /i bash "$GITHUB_WORKSPACE/fix_samsung_smali.sh"' build_port.sh
 
-          - name: Verify and Rename APK
-            env:
-              APK_NAME: ${{ inputs.apk_name }}
-            run: |
-              set -euo pipefail
+          PORT_ARGS=()
+          if [ "$AI_INPUT" = "true" ]; then
+            echo "AI smali review: ON"
+            PORT_ARGS+=(--ai)
+          else
+            echo "AI smali review: OFF"
+          fi
 
-              echo "Searching for generated APK files..."
-              find "$GITHUB_WORKSPACE" -type f -name "*.apk" -print
+          bash build_port.sh input.apk "$PATCH_NAME" "${PORT_ARGS[@]}"
 
-              APK_PATH="$GITHUB_WORKSPACE/out/input_ported.apk"
+      - name: Verify and Rename APK
+        env:
+          APK_NAME: ${{ inputs.apk_name }}
+        run: |
+          set -euo pipefail
 
-              if [ ! -s "$APK_PATH" ]; then
-                echo "::error::Ported APK not found or empty: $APK_PATH"
-                exit 1
-              fi
+          echo "Searching for generated APK files..."
+          find "$GITHUB_WORKSPACE" -type f -name "*.apk" -print
 
-              APK_NAME="${APK_NAME%.apk}"
-              APK_NAME="$(echo "$APK_NAME" | xargs)"
+          APK_PATH="$GITHUB_WORKSPACE/out/input_ported.apk"
 
-              if [[ ! "$APK_NAME" =~ ^[a-zA-Z0-9._-]+$ ]] || \
-                 [ "$APK_NAME" = "." ] || \
-                 [ "$APK_NAME" = ".." ] || \
-                 [ -z "$APK_NAME" ]; then
-                echo "::error::Invalid APK name."
-                echo "Use only letters, numbers, dots, underscores, and hyphens."
-                exit 1
-              fi
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::Ported APK not found or empty: $APK_PATH"
+            exit 1
+          fi
 
-              NEW_APK_PATH="$GITHUB_WORKSPACE/out/${APK_NAME}.apk"
+          APK_NAME="${APK_NAME%.apk}"
+          APK_NAME="$(echo "$APK_NAME" | xargs)"
 
-              if [ "$APK_PATH" != "$NEW_APK_PATH" ]; then
-                mv "$APK_PATH" "$NEW_APK_PATH"
-              fi
+          if [[ ! "$APK_NAME" =~ ^[a-zA-Z0-9._-]+$ ]] || \
+             [ "$APK_NAME" = "." ] || \
+             [ "$APK_NAME" = ".." ] || \
+             [ -z "$APK_NAME" ]; then
+            echo "::error::Invalid APK name."
+            echo "Use only letters, numbers, dots, underscores, and hyphens."
+            exit 1
+          fi
 
-              echo "APK verified and renamed successfully."
-              echo "Output: $NEW_APK_PATH"
-              echo "Size: $(du -h "$NEW_APK_PATH" | cut -f1)"
+          NEW_APK_PATH="$GITHUB_WORKSPACE/out/${APK_NAME}.apk"
 
-          - name: Create GitHub Release
-            env:
-              GH_TOKEN: ${{ github.token }}
-              RELEASE_NAME: ${{ inputs.run_id }}
-              PATCH_NAME: ${{ inputs.patch }}
-              APK_NAME: ${{ inputs.apk_name }}
-              AI_STATE: ${{ inputs.ai && 'on' || 'off' }}
-            run: |
-              set -euo pipefail
+          if [ "$APK_PATH" != "$NEW_APK_PATH" ]; then
+            mv "$APK_PATH" "$NEW_APK_PATH"
+          fi
 
-              RELEASE_NAME="$(echo "$RELEASE_NAME" | xargs)"
+          echo "APK verified and renamed successfully."
+          echo "Output: $NEW_APK_PATH"
+          echo "Size: $(du -h "$NEW_APK_PATH" | cut -f1)"
 
-              APK_NAME="${APK_NAME%.apk}"
-              APK_NAME="$(echo "$APK_NAME" | xargs)"
-              APK_PATH="$GITHUB_WORKSPACE/out/${APK_NAME}.apk"
+      - name: Upload APK and Reports as Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.run_id }}-ported-apk
+          path: |
+            ${{ github.workspace }}/out/*.apk
+            ${{ github.workspace }}/out/*.json
+          if-no-files-found: error
+          retention-days: 7
 
-              TAG="port-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-              BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+      - name: Send Notification to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RELEASE_ID: ${{ inputs.run_id }}
+          PATCH_NAME: ${{ inputs.patch }}
+        run: |
+          set -euo pipefail
 
-              if [ ! -s "$APK_PATH" ]; then
-                echo "::error::Renamed APK not found or empty: $APK_PATH"
-                exit 1
-              fi
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK secret is not set. Skipping Discord notification."
+            exit 0
+          fi
 
-              APK_SIZE="$(du -h "$APK_PATH" | cut -f1)"
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          
+          # Construct the Discord message payload
+          JSON_PAYLOAD=$(cat <<EOF
+          {
+            "content": "✅ **OEM App Port Completed!**",
+            "embeds": [{
+              "title": "Build: $RELEASE_ID",
+              "color": 3066993,
+              "description": "The **$PATCH_NAME** patch has been successfully applied to the APK.\n\n📥 **[Download the Artifacts Here]($RUN_URL)**",
+              "footer": {
+                "text": "AppsPorter GitHub Actions"
+              }
+            }]
+          }
+          EOF
+          )
 
-              ASSETS=("$APK_PATH")
-              if [ -s "$GITHUB_WORKSPACE/out/classfix_report.json" ]; then
-                ASSETS+=("$GITHUB_WORKSPACE/out/classfix_report.json")
-              fi
-              if [ -s "$GITHUB_WORKSPACE/out/ai_report.json" ]; then
-                ASSETS+=("$GITHUB_WORKSPACE/out/ai_report.json")
-              fi
-
-              gh release create "$TAG" "${ASSETS[@]}" \
-                --repo "$GITHUB_REPOSITORY" \
-                --title "$RELEASE_NAME" \
-                --notes "## 🚀 OEM App Port
-
-              Successfully generated a ported APK using GitHub Actions.
-
-              ### 📦 Build Information
-
-              | Property | Value |
-              |----------|-------|
-              | Release ID | \`${RELEASE_NAME}\` |
-              | Patch Type | \`${PATCH_NAME}\` |
-              | AI Review | \`${AI_STATE}\` |
-              | APK File | \`${APK_NAME}.apk\` |
-              | APK Size | \`${APK_SIZE}\` |
-              | Build Date | \`${BUILD_DATE}\` |
-              | Run ID | \`${GITHUB_RUN_ID}\` |
-              | Run Attempt | \`${GITHUB_RUN_ATTEMPT}\` |
-              | Repository | [\`${GITHUB_REPOSITORY}\`](https://github.com/${GITHUB_REPOSITORY}) |
-              | Workflow | [View Build Logs](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
-
-              ### 📥 Installation
-
-              1. Download \`${APK_NAME}.apk\` from the Assets section below and install it.
-              ---
-              *Generated automatically by GitHub Actions.*" \
-                --latest=false
-
-              echo "Release created successfully."
-              echo "Release ID: $RELEASE_NAME"
-              echo "Patch: $PATCH_NAME"
-              echo "APK: ${APK_NAME}.apk"
-              echo "Tag: $TAG"
-              echo "APK Size: $APK_SIZE"
+          # Send the webhook request
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "$JSON_PAYLOAD" \
+               "$DISCORD_WEBHOOK"
