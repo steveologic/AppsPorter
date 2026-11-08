@@ -1,4 +1,4 @@
-name: Porting OEM Apps
+name: Porting OEM
 run-name: ${{ inputs.run_id }}
 
 on:
@@ -50,7 +50,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y xmlstarlet
+          sudo apt-get install -y xmlstarlet apktool zipalign apksigner
 
       - name: Download source APK
         env:
@@ -78,25 +78,13 @@ jobs:
           echo "APK downloaded successfully."
           ls -lh "$APK_PATH"
 
-      - name: Run port
+      - name: Run port and enforce Smali fixes
         env:
           PATCH_NAME: ${{ inputs.patch }}
           AI_INPUT: ${{ inputs.ai }}
-          # optional: set a repo variable AI_API_URL to use another endpoint
           AI_API_URL: ${{ vars.AI_API_URL }}
         run: |
           set -euo pipefail
-
-          # Create a helper script to patch Samsung-specific AccessibilityManager calls
-          cat << 'EOF' > fix_samsung_smali.sh
-          echo "Applying custom Smali patch for semIsScreenReaderEnabled..."
-          find . -type f -name "*.smali" -exec sed -i \
-            's/Landroid\/view\/accessibility\/AccessibilityManager;->semIsScreenReaderEnabled()Z/Landroid\/view\/accessibility\/AccessibilityManager;->isTouchExplorationEnabled()Z/g' {} +
-          EOF
-          chmod +x fix_samsung_smali.sh
-
-          # Inject the helper script into build_port.sh right before apktool rebuilds the APK
-          sed -i '/apktool.* b /i bash "$GITHUB_WORKSPACE/fix_samsung_smali.sh"' build_port.sh
 
           PORT_ARGS=()
           if [ "$AI_INPUT" = "true" ]; then
@@ -106,16 +94,75 @@ jobs:
             echo "AI smali review: OFF"
           fi
 
+          # 1. Run standard AppsPorter build
           bash build_port.sh input.apk "$PATCH_NAME" "${PORT_ARGS[@]}"
+
+          PORTED_APK="$GITHUB_WORKSPACE/out/input_ported.apk"
+          if [ ! -s "$PORTED_APK" ]; then
+            echo "::error::Ported APK not found at $PORTED_APK"
+            exit 1
+          fi
+
+          # 2. Directly unpack the ported APK (smali only, skip resources with -r) to guarantee patch application
+          echo "=== Unpacking ported DEX files to patch Samsung AccessibilityManager calls ==="
+          APKTOOL_JAR=$(find "$GITHUB_WORKSPACE" -name "apktool*.jar" | head -n 1 || true)
+          WORK_DIR="$GITHUB_WORKSPACE/smali_fix_tmp"
+          rm -rf "$WORK_DIR"
+
+          if [ -n "$APKTOOL_JAR" ]; then
+            java -jar "$APKTOOL_JAR" d -r -f "$PORTED_APK" -o "$WORK_DIR"
+          else
+            apktool d -r -f "$PORTED_APK" -o "$WORK_DIR"
+          fi
+
+          echo "=== Searching for semIsScreenReaderEnabled in Smali ==="
+          grep -rn "semIsScreenReaderEnabled" "$WORK_DIR" || echo "No raw matches found before sed."
+
+          # Replace semIsScreenReaderEnabled()Z with standard AOSP isTouchExplorationEnabled()Z
+          find "$WORK_DIR" -type f -name "*.smali" -exec sed -i \
+            's/semIsScreenReaderEnabled()Z/isTouchExplorationEnabled()Z/g' {} +
+
+          echo "=== Verifying replacement ==="
+          if grep -rn "semIsScreenReaderEnabled" "$WORK_DIR"; then
+            echo "::error::Failed to replace semIsScreenReaderEnabled!"
+            exit 1
+          else
+            echo "Successfully replaced all instances with isTouchExplorationEnabled()Z"
+          fi
+
+          # 3. Rebuild the patched APK
+          UNSIGNED_APK="$GITHUB_WORKSPACE/out/unsigned_patched.apk"
+          ALIGNED_APK="$GITHUB_WORKSPACE/out/aligned_patched.apk"
+
+          if [ -n "$APKTOOL_JAR" ]; then
+            java -jar "$APKTOOL_JAR" b "$WORK_DIR" -o "$UNSIGNED_APK"
+          else
+            apktool b "$WORK_DIR" -o "$UNSIGNED_APK"
+          fi
+
+          # 4. Zipalign and Re-sign the APK
+          zipalign -p -f 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+
+          PK8_FILE=$(find "$GITHUB_WORKSPACE/keys" -name "*.pk8" | head -n 1 || true)
+          PEM_FILE=$(find "$GITHUB_WORKSPACE/keys" -name "*.x509.pem" | head -n 1 || true)
+
+          if [ -n "$PK8_FILE" ] && [ -n "$PEM_FILE" ]; then
+            echo "Signing with repo AOSP keys: $PK8_FILE"
+            apksigner sign --key "$PK8_FILE" --cert "$PEM_FILE" --out "$PORTED_APK" "$ALIGNED_APK"
+          else
+            echo "Generating temporary debug key for signing..."
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            apksigner sign --ks debug.keystore --ks-pass pass:android --out "$PORTED_APK" "$ALIGNED_APK"
+          fi
+
+          rm -rf "$WORK_DIR" "$UNSIGNED_APK" "$ALIGNED_APK"
+          echo "=== Custom Smali patching and re-signing complete! ==="
 
       - name: Verify and Rename APK
         env:
           APK_NAME: ${{ inputs.apk_name }}
         run: |
           set -euo pipefail
-
-          echo "Searching for generated APK files..."
-          find "$GITHUB_WORKSPACE" -type f -name "*.apk" -print
 
           APK_PATH="$GITHUB_WORKSPACE/out/input_ported.apk"
 
@@ -132,7 +179,6 @@ jobs:
              [ "$APK_NAME" = ".." ] || \
              [ -z "$APK_NAME" ]; then
             echo "::error::Invalid APK name."
-            echo "Use only letters, numbers, dots, underscores, and hyphens."
             exit 1
           fi
 
@@ -142,9 +188,7 @@ jobs:
             mv "$APK_PATH" "$NEW_APK_PATH"
           fi
 
-          echo "APK verified and renamed successfully."
-          echo "Output: $NEW_APK_PATH"
-          echo "Size: $(du -h "$NEW_APK_PATH" | cut -f1)"
+          echo "APK verified and renamed successfully: $NEW_APK_PATH"
 
       - name: Upload APK and Reports as Artifacts
         uses: actions/upload-artifact@v4
@@ -171,14 +215,13 @@ jobs:
 
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           
-          # Construct the Discord message payload
           JSON_PAYLOAD=$(cat <<EOF
           {
             "content": "✅ **OEM App Port Completed!**",
             "embeds": [{
               "title": "Build: $RELEASE_ID",
               "color": 3066993,
-              "description": "The **$PATCH_NAME** patch has been successfully applied to the APK.\n\n📥 **[Download the Artifacts Here]($RUN_URL)**",
+              "description": "The **$PATCH_NAME** patch + custom Smali fixes have been applied.\n\n📥 **[Download the Artifacts Here]($RUN_URL)**",
               "footer": {
                 "text": "AppsPorter GitHub Actions"
               }
@@ -187,7 +230,6 @@ jobs:
           EOF
           )
 
-          # Send the webhook request
           curl -H "Content-Type: application/json" \
                -X POST \
                -d "$JSON_PAYLOAD" \
